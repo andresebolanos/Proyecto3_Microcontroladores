@@ -229,77 +229,120 @@ unsigned char MAX30102_IsConnected(void) {
 
 unsigned char MAX30102_ProcesarBPM(unsigned long raw_red, unsigned char *bpm_out) {
     static unsigned long dc_filter = 0;
+    static long filtered_ac = 0;        
     static long last_ac = 0;
     static unsigned int sample_counter = 0;
     static unsigned int last_beat_time = 0;
     
+    static long max_val = 0;
+    static long min_val = 0;
     static long threshold = 0;
-    static long max_val = -999999;
-    static long min_val = 999999;
     
-    static unsigned char bpm_buffer[8] = {0,0,0,0,0,0,0,0}; 
+    static unsigned char bpm_buffer[4] = {0,0,0,0}; 
     static unsigned char buffer_idx = 0;
+    static unsigned char primer_latido = 1; 
 
+    // Limpieza inmediata si se retira el dedo
     if (raw_red < 15000) { 
-        dc_filter = 0; last_beat_time = 0; sample_counter = 0;
-        max_val = -999999; min_val = 999999; threshold = 0;
-        for(unsigned char i=0; i<8; i++) bpm_buffer[i] = 0;
-        *bpm_out = 0; return 0;
+        dc_filter = 0; 
+        filtered_ac = 0; 
+        last_beat_time = 0; 
+        sample_counter = 0;
+        max_val = 0; 
+        min_val = 0; 
+        threshold = 0;
+        for(unsigned char i=0; i<4; i++) bpm_buffer[i] = 0;
+        primer_latido = 1;
+        *bpm_out = 0; 
+        return 0;
     }
 
-    if (dc_filter == 0) dc_filter = raw_red << 4;
+    // Inicialización rápida al colocar el dedo por primera vez
+    if (dc_filter == 0) {
+        dc_filter = raw_red << 4;
+        filtered_ac = 0;
+        max_val = 50; 
+        min_val = -50;
+        sample_counter = 0;
+        last_beat_time = 0;
+    }
 
-    dc_filter = (dc_filter * 63 + (raw_red << 4)) / 64;
+    // 1. FILTRO PASA-ALTOS (Elimina el offset continuo)
+    dc_filter = (dc_filter * 31 + (raw_red << 4)) / 32;
     long ac_signal = (raw_red << 4) - dc_filter;
     ac_signal = ac_signal >> 4; 
 
+    // 2. FILTRO PASA-BAJOS (Suaviza la señal y elimina la onda dicrótica)
+    filtered_ac = (filtered_ac * 3 + ac_signal) / 4;
+
     sample_counter++;
 
-    if (ac_signal > max_val) max_val = ac_signal;
-    if (ac_signal < min_val) min_val = ac_signal;
+    /* --- SEGUIDOR DE PICOS DINÁMICO ACELERADO --- */
+    if (filtered_ac > max_val) {
+        max_val = filtered_ac;
+    } else {
+        max_val -= (max_val - filtered_ac) / 16; 
+    }
 
-    if (sample_counter % 50 == 0) {
-        threshold = min_val + ((max_val - min_val) * 2 / 3); 
-        
-        if ((max_val - min_val) < 40) threshold = 0; 
-        max_val = -999999; min_val = 999999;
+    if (filtered_ac < min_val) {
+        min_val = filtered_ac;
+    } else {
+        min_val += (filtered_ac - min_val) / 16;
+    }
+
+    // Calculamos el umbral óptimo al 60% de la amplitud de la señal filtrada
+    long amplitud = max_val - min_val;
+    if (amplitud > 40) {
+        threshold = min_val + (amplitud * 6 / 10); 
+    } else {
+        threshold = 0; 
     }
 
     unsigned char latido_detectado = 0;
     
-    
-    if (ac_signal > threshold && last_ac <= threshold && (sample_counter - last_beat_time) > 45) {
+    // 3. DETECCIÓN CON CANDADO OPTIMIZADO A 20 MUESTRAS (~150 LPM Máximo)
+    if (filtered_ac > threshold && last_ac <= threshold && (sample_counter - last_beat_time) > 20) {
         
         if (last_beat_time > 0) {
             unsigned int intervalo_muestras = sample_counter - last_beat_time;
 
-            
-            if (intervalo_muestras >= 45 && intervalo_muestras <= 100) {
+            // Rango seguro para pulso en reposo/moderado (20 a 75 muestras)
+            if (intervalo_muestras >= 20 && intervalo_muestras <= 75) {
                 
-                
-                unsigned char raw_bpm = (unsigned char)(6000 / intervalo_muestras);
+                // Constante matemática exacta para 50Hz (60 * 50 = 3000)
+                unsigned char raw_bpm = (unsigned char)(3000 / intervalo_muestras);
 
-                bpm_buffer[buffer_idx] = raw_bpm;
-                buffer_idx = (buffer_idx + 1) % 8; // Ciclo sobre 8
+                // 4. CORREGIDO: Filtro de estabilidad usando 'promedio_actual'
+                if (!primer_latido) {
+                    unsigned int suma_temporal = 0;
+                    for (unsigned char i = 0; i < 4; i++) suma_temporal += bpm_buffer[i];
+                    unsigned char promedio_actual = suma_temporal / 4;
+                    
+                    if (raw_bpm > promedio_actual + 20) raw_bpm = promedio_actual + 10;
+                    else if (raw_bpm < promedio_actual - 20) raw_bpm = promedio_actual - 10;
+                }
+
+                // Llenado del buffer promedio de 4 muestras
+                if (primer_latido) {
+                    for(unsigned char i = 0; i < 4; i++) bpm_buffer[i] = raw_bpm;
+                    primer_latido = 0;
+                } else {
+                    bpm_buffer[buffer_idx] = raw_bpm;
+                    buffer_idx = (buffer_idx + 1) % 4; 
+                }
 
                 unsigned int suma = 0;
-                unsigned char lecturas_validas = 0;
-                for (unsigned char i = 0; i < 8; i++) {
-                    if (bpm_buffer[i] > 0) {
-                        suma += bpm_buffer[i];
-                        lecturas_validas++;
-                    }
+                for (unsigned char i = 0; i < 4; i++) {
+                    suma += bpm_buffer[i];
                 }
 
-                if (lecturas_validas > 0) {
-                    *bpm_out = suma / lecturas_validas;
-                    latido_detectado = 1; 
-                }
+                *bpm_out = suma / 4;
+                latido_detectado = 1; 
             }
         }
         last_beat_time = sample_counter;
     }
 
-    last_ac = ac_signal;
+    last_ac = filtered_ac; 
     return latido_detectado;
 }
