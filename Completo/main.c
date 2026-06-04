@@ -32,16 +32,25 @@
  */
 
 /**
- * @file    main.c
- * @brief   Orquestador e Integración Final del Monitor Portátil de Signos Vitales.
- * @details Gestiona el bucle principal de ejecución del PIC18F4550. Integra
- *          el control de temporización por Timer0 a 50Hz, capturas asíncronas por 
- *          interrupción externa del botón de ahorro de energía (Sleep), procesamiento
- *          en tiempo real de temperatura médica y ritmo cardíaco, y alarmas audiovisuales.
+ * @file main.c
+ * @brief Aplicación principal del Monitor Portátil de Signos Vitales.
  *
- * @author  Andres Bolanos, Jeison Tuquerrez
- * @date    2026
- * @version 1.0
+ * Este módulo implementa la lógica principal del sistema encargado
+ * del monitoreo de frecuencia cardíaca y temperatura corporal mediante
+ * los sensores MAX30102 y DS18B20.
+ *
+ * Funcionalidades implementadas:
+ * - Adquisición periódica de señales biomédicas.
+ * - Visualización de datos mediante pantalla OLED SSD1306.
+ * - Comunicación serial UART para monitoreo externo.
+ * - Alarmas visuales y sonoras por valores fuera de rango.
+ * - Retención de la última medición válida (Data Hold).
+ * - Modo de bajo consumo mediante Sleep/Wakeup.
+ * - Estabilización térmica del sensor DS18B20.
+ *
+ * @author Andres Bolaños
+ * @author Jeison Tuquerres
+ * @date 2026
  */
 
 #include "Configuracion.h"
@@ -49,33 +58,19 @@
 #include "MAX30102_Libreria.h"
 #include "ds18b20.h"  
 #include "uart.h"     
-
-/**
- * @brief Se incluye stdio.h únicamente para sprintf().
- * @note sprintf() consume aproximadamente 2KB de ROM. Si se requiere
- *       optimizar memoria, reemplazar por conversiones manuales.
- */
 #include <stdio.h>    
+#include <xc.h>
 
-/* =========================================
- * DEFINICIONES DE HARDWARE (PINOUT)
- * ========================================= */
+/* =========================================================
+ * 1. ASIGNACI�N COMPLETA DE PINES (PUERTO D y PUERTO B)
+ * ========================================================= */
+#define LED_ENCENDIDO        LATDbits.LATD0  // RD0 
+#define LED_PREPARANDO       LATDbits.LATD2  // RD2 
+#define LED_FUNCIONAL        LATDbits.LATD3  // RD3 
+#define LED_ESPERA           LATDbits.LATD4  // RD4 
+#define LED_ALARMA           LATDbits.LATD5  // RD5 
+#define BUZZER               LATDbits.LATD6  // RD6 -> Alarma sonora
 
-/**
- * @defgroup Pinout_Mapping Mapeo de Pines del Hardware
- * @brief Asignación de funciones a pines específicos del PIC18F4550.
- * @{
- */
-
-/* --- LEDs de Estado --- */
-#define LED_ENCENDIDO        LATDbits.LATD0  /**< @brief RD0: Sistema encendido/activo */
-#define LED_PREPARANDO       LATDbits.LATD2  /**< @brief RD2: Inicialización en progreso */
-#define LED_FUNCIONAL        LATDbits.LATD3  /**< @brief RD3: Dedo detectado correctamente */
-#define LED_ESPERA           LATDbits.LATD4  /**< @brief RD4: Esperando colocación del dedo */
-#define LED_ALARMA           LATDbits.LATD5  /**< @brief RD5: Alerta visual (parámetros fuera de rango) */
-#define BUZZER               LATDbits.LATD6  /**< @brief RD6: Alerta sonora (zumbador piezoeléctrico) */
-
-/* --- Registros de Dirección de los LEDs --- */
 #define TRIS_LED_ENCENDIDO   TRISDbits.TRISD0
 #define TRIS_LED_PREPARANDO  TRISDbits.TRISD2
 #define TRIS_LED_FUNCIONAL   TRISDbits.TRISD3
@@ -83,331 +78,262 @@
 #define TRIS_LED_ALARMA      TRISDbits.TRISD5
 #define TRIS_BUZZER          TRISDbits.TRISD6
 
-/* --- Entradas --- */
-#define TRIS_BOTON_SLEEP     TRISBbits.TRISB2 /**< @brief RB2: Botón de sleep (INT2) */
+#define TRIS_BOTON_SLEEP     TRISBbits.TRISB2 // Bot�n INT2
 
-/** @} */ // Fin de Pinout_Mapping
-
-/* =========================================
- * CONSTANTES DEL SISTEMA
- * ========================================= */
+#define TEMP_MAX 37.5
+#define TEMP_MIN 32.0  // Umbral donde se considera temperatura humana v�lida
+#define BPM_MAX 100
+#define BPM_MIN 60
 
 /**
- * @defgroup System_Constants Constantes del Sistema
- * @brief Parámetros de configuración del comportamiento del firmware.
- * @{
- */
-
-/** 
- * @defgroup Clinical_Thresholds Umbrales de Seguridad Clínica
- * @brief Valores límite para activar el protocolo de alarma médica.
- * @{
- */
-#define TEMP_MAX 37.5f   /**< @brief Temperatura máxima normal (°C) - Por encima: fiebre */
-#define TEMP_MIN 30.0f   /**< @brief Temperatura mínima normal (°C) - Por debajo: hipotermia/error */
-#define BPM_MAX  100     /**< @brief Frecuencia cardíaca máxima normal (LPM) - Taquicardia */
-#define BPM_MIN  60      /**< @brief Frecuencia cardíaca mínima normal (LPM) - Bradicardia */
-/** @} */
-
-/**
- * @defgroup Timing_Constants Constantes de Temporización
- * @brief Valores para temporizadores y retardos.
- * @{
- */
-#define TIMER0_PRELOAD_H   0x63  /**< @byte Alto para precarga de Timer0 (20ms @ 8MHz) */
-#define TIMER0_PRELOAD_L   0xC0  /**< @byte Bajo para precarga de Timer0 (20ms @ 8MHz) */
-#define SAMPLES_PER_UPDATE 100   /**< @brief Muestras necesarias para actualizar temperatura (2 seg @ 50Hz) */
-#define DEBOUNCE_DELAY_MS  200   /**< @brief Retardo antirrebote para el botón de sleep (ms) */
-#define MIN_VALID_TEMP     20.0f /**< @brief Temperatura mínima para considerar válida y guardar en histórico */
-
-/** 
- * @brief Umbral de detección de dedo en el sensor MAX30102.
- * @note Debe coincidir con MAX_MIN_SIGNAL definido en MAX30102_Libreria.h
- */
-#define DETECTION_THRESHOLD 15000
-
-/** @} */
-
-/**
- * @defgroup Display_States Estados de la Pantalla OLED
- * @brief Valores para la máquina de estados de la interfaz gráfica.
- * @{
- */
-#define DISPLAY_STATE_IDLE       0  /**< @brief Pantalla de espera (sin dedo) */
-#define DISPLAY_STATE_CALCULATING 1  /**< @brief Calculando pulso (dedo detectado, estabilizando) */
-#define DISPLAY_STATE_MEASURING   2  /**< @brief Mostrando mediciones activas */
-#define DISPLAY_STATE_FORCE_REFRESH 99 /**< @brief Forzar refresco completo de pantalla */
-/** @} */
-
-/** @} */ // Fin de System_Constants
-
-/* =========================================
- * VARIABLES GLOBALES (INTERRUPCIÓN)
- * ========================================= */
-
-/**
- * @defgroup Interrupt_Flags Banderas de Interrupción
- * @brief Variables modificadas exclusivamente dentro del contexto de la ISR.
- * @note Todas son volatile para evitar optimizaciones del compilador.
- * @{
- */
-
-/**
- * @brief Bandera activada a 50Hz por Timer0.
- * @details Indica al bucle principal que existe una nueva muestra disponible.
+ * @brief Bandera activada por Timer0.
+ *
+ * Indica al programa principal que debe realizar una nueva
+ * iteración del proceso de muestreo.
  */
 volatile unsigned char flag_nueva_muestra = 0;
 
-/** 
-* @brief Bandera activada por INT2 (botón). Solicita cambio de estado sleep/wake. 
-*/
+/**
+ * @brief Bandera de cambio de estado energético.
+ *
+ * Se activa cuando ocurre una interrupción externa INT2,
+ * solicitando la transición entre los modos activo y Sleep.
+ */
 volatile unsigned char flag_cambiar_power = 0;
 
-/** @} */ // Fin de Interrupt_Flags
-
-/* =========================================
- * PROTOTIPOS DE FUNCIONES PRIVADAS
- * ========================================= */
-
 /**
- * @brief   Desactiva los actuadores y pone en bajo consumo los periféricos esclavos.
- * @details Apaga todos los transistores/LEDs conectados al puerto D, limpia la pantalla
- *          OLED para que sus píxeles no consuman energía y envía el comando físico 
- *          de SHUTDOWN al integrado MAX30102 apagando sus LEDs.
- * @post    El sistema está listo para entrar en modo SLEEP.
- */
-static void Apagar_Sistema_Completo(void);
-
-/* =========================================
- * IMPLEMENTACIÓN DE FUNCIONES PRIVADAS
- * ========================================= */
-
-/**
- * @brief   Desactiva los actuadores y pone en bajo consumo los periféricos esclavos.
- * @details Apaga todos los transistores/LEDs conectados al puerto D, limpia la pantalla
- *          OLED para que sus píxeles no consuman energía y envía el comando físico 
- *          de SHUTDOWN al integrado MAX30102 apagando sus matrices de luz LED roja.
- */
-static void Apagar_Sistema_Completo(void) {
-    LATD = 0x00;         /* Apaga todos los LEDs y el buzzer */
-    OLED_Clear();        /* Limpia la pantalla (píxeles apagados = menor consumo) */
-    MAX30102_Shutdown(); /* Apaga el LED rojo del sensor */
-}
-
-/* =========================================
- * RUTINA DE SERVICIO DE INTERRUPCIÓN
- * ========================================= */
-
-/**
- * @brief   Rutina de Servicio de Interrupción Única (ISR).
- * @details Administra los vectores de prioridad del PIC18F4550 de forma unificada:
- *          
- *          1. **Timer0 (Muestreo a 50Hz)**:
- *             - Limpia la bandera TMR0IF
- *             - Recarga los valores de precarga de 16 bits
- *             - Activa flag_nueva_muestra para el lazo principal
- *          
- *          2. **INT2 (Botón de Sleep en RB2)**:
- *             - Limpia INT2IF
- *             - Activa flag_cambiar_power para solicitar cambio de estado
- * 
- * @warning Esta ISR no debe contener retardos ni funciones complejas.
- *          Solo maneja banderas y recargas de timer.
+ * @brief Rutina de servicio de interrupciones.
+ *
+ * Gestiona las interrupciones generadas por:
+ * - Timer0: base de tiempo de 50 Hz para muestreo.
+ * - INT2: control del modo Sleep/Wakeup mediante pulsador.
+ *
+ * La rutina únicamente actualiza banderas de control para
+ * minimizar el tiempo de ejecución dentro de la ISR.
  */
 void __interrupt() ISR(void) {
-    /* ===== 1. Interrupción de Timer0 (Muestreo Estricto a 50Hz) ===== */
+    // 1. Interrupci�n de Timer0 (Muestreo 50Hz)
     if (INTCONbits.TMR0IF) {
-        INTCONbits.TMR0IF = 0;          /* Limpia bandera */
-        TMR0H = TIMER0_PRELOAD_H;       /* Recarga byte alto */
-        TMR0L = TIMER0_PRELOAD_L;       /* Recarga byte bajo */
-        flag_nueva_muestra = 1;         /* Notifica al bucle principal */
+        INTCONbits.TMR0IF = 0;  
+        TMR0H = 0x63; 
+        TMR0L = 0xC0; 
+        flag_nueva_muestra = 1;  
     }
     
-    /* ===== 2. Interrupción Externa INT2 (Botón de Ahorro en RB2) ===== */
+    // 2. Interrupci�n Externa INT2 (Bot�n en RB2 presionado)
     if (INTCON3bits.INT2IF) {
-        INTCON3bits.INT2IF = 0;         /* Limpia bandera */
-        flag_cambiar_power = 1;         /* Solicita cambio de estado de energía */
+        INTCON3bits.INT2IF = 0;         // Limpiar bandera de interrupci�n INT2
+        flag_cambiar_power = 1;         // Avisar al bucle principal
     }
 }
 
-/* =========================================
- * FUNCIÓN PRINCIPAL
- * ========================================= */
+/**
+ * @brief Apaga los periféricos antes de ingresar al modo Sleep.
+ *
+ * Desactiva LEDs, buzzer, pantalla OLED y coloca el sensor
+ * MAX30102 en modo de bajo consumo para minimizar el consumo
+ * energético durante la suspensión del sistema.
+ */
+void Apagar_Sistema_Completo(void) {
+    LATD = 0x00;         // Apagar todos los LEDs y Buzzer
+    OLED_Clear();        // Limpiar pantalla 
+    MAX30102_Shutdown(); // Apagar diodos internos del ox�metro
+}
 
 /**
- * @brief   Punto de entrada principal del firmware del monitor médico.
- * @details Realiza la configuración completa del sistema:
- *          
- *          **1. Configuración inicial:**
- *          - Oscilador interno a 8 MHz (OSCCON)
- *          - Direcciones E/S digitales (TRIS)
- *          - LEDs y periféricos de salida
- *          
- *          **2. Inicialización de drivers:**
- *          - UART (telemetría)
- *          - I2C (comunicación con OLED y MAX30102)
- *          - OLED (pantalla)
- *          - MAX30102 (sensor de pulso)
- *          - DS18B20 (sensor de temperatura)
- *          
- *          **3. Configuración de interrupciones:**
- *          - Timer0 para base de tiempo de 50Hz
- *          - INT2 para botón de sleep
- *          - Interrupciones globales habilitadas
- *          
- *          **4. Bucle principal:**
- *          - Gestión de sleep/wake por botón
- *          - Muestreo a 50Hz sincronizado por Timer0
- *          - Procesamiento de señales médicas
- *          - Actualización de pantalla y alarmas
- * 
- * @post    El sistema opera indefinidamente en el bucle principal.
+ * @brief Función principal del sistema.
+ *
+ * Realiza la inicialización de periféricos y ejecuta la máquina
+ * de estados principal encargada del monitoreo biomédico.
+ *
+ * Estados implementados:
+ * - Estado 0: Espera inicial.
+ * - Estado 1: Retención de la última medición.
+ * - Estado 2: Procesamiento y estabilización de sensores.
+ * - Estado 4: Visualización activa de mediciones.
+ *
+ * Funciones principales:
+ * - Adquisición de datos del MAX30102.
+ * - Lectura periódica del DS18B20.
+ * - Cálculo de frecuencia cardíaca.
+ * - Gestión de alarmas.
+ * - Comunicación UART.
+ * - Control de energía mediante Sleep/Wakeup.
+ *
+ * @note El DS18B20 utiliza un periodo de estabilización de
+ * aproximadamente 10 segundos antes de habilitar la visualización
+ * de la temperatura corporal.
  */
 void main(void) {
-    /* =========================================
-     * 1. CONFIGURACIÓN DEL OSCILADOR
-     * ========================================= */
-    OSCCON = 0x72;      /* Oscilador interno a 8 MHz */
+    OSCCON = 0x72; // Configurar oscilador interno a 8MHz
     
-    /* =========================================
-     * 2. CONFIGURACIÓN DE PINES DE SALIDA
-     * ========================================= */
+    // Configurar pines de LEDs y Buzzer como salidas
     TRIS_LED_ENCENDIDO = 0;   TRIS_LED_PREPARANDO = 0;
     TRIS_LED_FUNCIONAL = 0;    TRIS_LED_ESPERA = 0;
     TRIS_LED_ALARMA = 0;       TRIS_BUZZER = 0;
     
-    /* =========================================
-     * 3. CONFIGURACIÓN DEL BOTÓN DE SLEEP (INT2)
-     * ========================================= */
-    TRIS_BOTON_SLEEP = 1;                       /* Entrada digital */
-    INTCON2bits.INTEDG2 = 0;                    /* Flanco de bajada (presión a GND) */
-    INTCON3bits.INT2IF = 0;                     /* Limpia bandera */
-    INTCON3bits.INT2IE = 1;                     /* Habilita interrupción INT2 */
+    // Configurar RB2 (INT2) como entrada digital para el bot�n
+    TRIS_BOTON_SLEEP = 1;
+    INTCON2bits.INTEDG2 = 0;   // Interrupci�n por flanco de bajada para INT2 (Presionar a GND)
+    INTCON3bits.INT2IF = 0;     // Limpiar bandera inicial de INT2
+    INTCON3bits.INT2IE = 1;     // Habilitar la interrupci�n externa INT2
     
-    /* =========================================
-     * 4. ESTADO VISUAL DE ARRANQUE
-     * ========================================= */
+    // Estado inicial de arranque
     LED_ENCENDIDO = 1;   LED_PREPARANDO = 1;  
-    LED_FUNCIONAL = 0;   LED_ESPERA = 0;   
-    LED_ALARMA = 0;      BUZZER = 0;
+    LED_FUNCIONAL = 0;   LED_ESPERA = 0;   LED_ALARMA = 0;   BUZZER = 0;
     
-    /* =========================================
-     * 5. INICIALIZACIÓN DE DRIVERS Y PERIFÉRICOS
-     * ========================================= */
-    UART_Init();        /* Puerto serie para telemetría */
-    I2C_Init();         /* Bus I2C para OLED y MAX30102 */
-    OLED_Init();        /* Pantalla gráfica */
-    MAX30102_Init();    /* Sensor de pulso */
-    DS18B20_Init();     /* Sensor de temperatura 1-Wire */
+    // Inicializaci�n de hardware
+    UART_Init();    
+    I2C_Init();
+    OLED_Init();
+    MAX30102_Init();
+    DS18B20_Init(); 
     
-    __delay_ms(500);          /* Estabilización */
-    LED_PREPARANDO = 0;       /* Sistema listo */
+    /* Pantalla de bienvenida */
+    OLED_Clear();
+    OLED_String(0, 0, "MONITOR DE");
+    OLED_String(2, 0, "SIGNOS VITALES");
+    OLED_String(6, 0, "Inicializando");
+
+    __delay_ms(2500);
+
+    /* Sensores listos */
+    LED_PREPARANDO = 0;
+
+    OLED_Clear();
+    OLED_String(0, 0, "MONITOR CARDIACO");
+    OLED_String(3, 0, "Coloque el dedo");
+    OLED_String(5, 0, "en el sensor");
     
-    /* =========================================
-     * 6. INTERFAZ DE USUARIO INICIAL
-     * ========================================= */
-    OLED_String(0, 0, "   PULSIOXIMETRO ");
-    OLED_String(2, 0, " Coloque el dedo ");
-    OLED_String(4, 0, " Temp: --.-- C   ");
+    MAX30102_Sample datos_sensor;
+    unsigned char lpm = 0;
+    unsigned char last_lpm = 0;
+    unsigned char estado_pantalla = 0; 
     
-    /* =========================================
-     * 7. VARIABLES LOCALES
-     * ========================================= */
-     MAX30102_Sample datos_sensor;          /**< Muestra cruda del sensor MAX30102 */
-
-    unsigned char lpm = 0;                 /**< Latidos por minuto actuales */
-    unsigned char last_lpm = 0;            /**< Último LPM mostrado */
-    unsigned char estado_pantalla = DISPLAY_STATE_IDLE;     /**< Estado actual de la interfaz OLED */
-
-    float temperatura = 0.0f;             /**< Temperatura actual en °C */
-    unsigned int contador_muestras_temp = 0; /**< Contador para actualización periódica de temperatura */
-
-    char buffer_texto[16];                 /**< Buffer de texto para mostrar BPM */
-    char buffer_temp[16];                  /**< Buffer de texto para mostrar temperatura */
-
-    unsigned char ultimo_lpm = 0;          /**< Último BPM válido almacenado */
-    float ultima_temp = 0.0f;              /**< Última temperatura válida almacenada */
-    unsigned char tiene_registro = 0;      /**< Indica si existe histórico de mediciones */
-    unsigned char sistema_dormido = 0;     /**< Estado actual del modo Sleep */
-
-    unsigned char latido_real;             /**< Indica detección de latido válido */
+    float temperatura = 0.0;
+    unsigned int contador_muestras_temp = 0; 
+    char buffer_texto[16];
+    char buffer_temp[16]; 
     
-    /* Inicia primera conversión del DS18B20 (no bloqueante) */
-    DS18B20_StartConversion();
-    
-    /* =========================================
-     * 8. CONFIGURACIÓN DEL TIMER0 (Base de tiempo 50Hz)
-     * ========================================= */
-    T0CON = 0x88;       /* Timer0 activo, 16 bits, sin prescaler (1 ciclo = 0.5µs @ 8MHz) */
-    TMR0H = TIMER0_PRELOAD_H;
-    TMR0L = TIMER0_PRELOAD_L;
-    INTCONbits.TMR0IF = 0;
-    INTCONbits.TMR0IE = 1;      /* Habilita interrupción de Timer0 */
-    INTCONbits.PEIE = 1;        /* Habilita interrupciones periféricas */
-    INTCONbits.GIE = 1;         /* Habilita interrupciones globales */
+    /**
+    * @brief Variables de retención de datos.
+    *
+    * Almacenan la última frecuencia cardíaca y temperatura
+    * válidas obtenidas por el sistema.
+    *
+    * Estas variables permiten mostrar la última medición
+    * cuando el usuario retira el dedo del sensor.
+    */
+    unsigned char ultimo_lpm = 0;
+    float ultima_temp = 0.0;
 
-    /* =========================================
-     * 9. BUCLE PRINCIPAL INFINITO
-     * ========================================= */
+    unsigned char temperatura_valida = 0;
+    unsigned char tiene_registro = 0; 
+    unsigned char sistema_dormido = 0; 
+
+    /**
+    * @brief Variables de estabilización térmica.
+    *
+    * El sensor DS18B20 requiere un tiempo de adaptación
+    * para alcanzar equilibrio térmico con la piel del usuario.
+    *
+    * temperatura_estable:
+    * Indica que el período de estabilización ha finalizado.
+    *
+    * ciclos_estabilizacion:
+    * Contador utilizado para estimar aproximadamente
+    * 10 segundos de estabilización térmica.
+    */
+    unsigned char temperatura_estable = 0;
+    unsigned char ciclos_estabilizacion = 0;
+    
+    DS18B20_StartConversion(); 
+    
+    // CONFIGURACI�N TIMER0
+    T0CON = 0x88; 
+    TMR0H = 0x63; 
+    TMR0L = 0xC0; 
+    INTCONbits.TMR0IF = 0; 
+    INTCONbits.TMR0IE = 1; 
+    INTCONbits.PEIE = 1;   
+    INTCONbits.GIE = 1;    
+
     while(1) {
         
-        /* ===== GESTIÓN DE ENERGÍA: SLEEP/WAKE ===== */
+        /* GESTI�N DE ENERG�A: PETICI�N DE DORMIR O DESPERTAR */
         if (flag_cambiar_power == 1) {
             flag_cambiar_power = 0;
-            __delay_ms(DEBOUNCE_DELAY_MS);      /* Filtro antirrebote */
+            __delay_ms(200);
             
             if (sistema_dormido == 0) {
-                /* --- ENTRAR EN MODO SLEEP --- */
                 sistema_dormido = 1;
                 Apagar_Sistema_Completo();
                 
-                SLEEP();    /* Detiene CPU - consumo ultra bajo */
-                NOP();      /* Post-sleep: instrucción requerida por arquitectura */
+                SLEEP(); // El micro se duerme aqu�
+                NOP();   
             } else {
-                /* --- DESPERTAR DEL SLEEP --- */
                 sistema_dormido = 0;
                 
-                /* Re-inicialización de periféricos después del sleep */
-                OSCCON = 0x72;          /* Restaurar frecuencia */
+                // Descongelar oscilador y re-inicializar buses esenciales
+                OSCCON = 0x72; 
                 I2C_Init();
                 OLED_Init();
                 MAX30102_Init();
                 
                 LED_ENCENDIDO = 1;
-                estado_pantalla = DISPLAY_STATE_FORCE_REFRESH;
+                estado_pantalla = 99; // Fuerza refresco total de pantalla al despertar
                 flag_nueva_muestra = 0;
                 DS18B20_StartConversion();
             }
         }
 
-        /* Si el sistema está dormido, saltar todo el procesamiento */
         if (sistema_dormido == 1) {
             continue; 
         }
 
-        /* ===== BUCLE DE MUESTREO SINCRONIZADO A 50Hz ===== */
+        /* BUCLE DE MUESTREO NORMAL Y M�QUINA DE ESTADOS */
         if (flag_nueva_muestra == 1) {
             flag_nueva_muestra = 0; 
             
-            /* Lectura del sensor MAX30102 */
             if (MAX30102_ReadSample(&datos_sensor)) {
                 
-                /* --- ACTUALIZACIÓN DE TEMPERATURA (cada 2 segundos) --- */
+                // BLOQUE LENTO (CADA 2 SEGUNDOS) - LECTURA DS18B20 + UART
                 contador_muestras_temp++;
-                if (contador_muestras_temp >= SAMPLES_PER_UPDATE) {  
+                if (contador_muestras_temp >= 100) {  
                     contador_muestras_temp = 0; 
                     
-                    /* Lectura del DS18B20 */
                     if (DS18B20_ReadTemperature(&temperatura) == DS18B20_OK) {
-                        /* Actualizar pantalla si no estamos mostrando histórico */
-                        if (!(estado_pantalla == DISPLAY_STATE_IDLE && tiene_registro == 1)) {
-                            sprintf(buffer_temp, " Temp: %0.2f C   ", temperatura);
-                            OLED_String(4, 0, buffer_temp); 
+
+                        temperatura_valida = 1;
+
+                        /**
+                        * @brief Proceso de estabilización térmica.
+                        *
+                        * Se requieren aproximadamente cinco conversiones válidas
+                        * del DS18B20 antes de considerar estable la temperatura.
+                        *
+                        * Dado que cada lectura ocurre aproximadamente cada
+                        * dos segundos, el período total de estabilización es
+                        * cercano a los diez segundos.
+                        */
+                        if (ciclos_estabilizacion < 5)
+                        {
+                            ciclos_estabilizacion++;
+                        }
+                        else
+                        {
+                            temperatura_estable = 1;
+                        }
+
+                        /* Actualizaci�n normal cuando ya estamos mostrando resultados */
+                        if (estado_pantalla == 4) {
+                            sprintf(buffer_temp, "Temp:%0.2f C     ", temperatura);
+                            OLED_String(4, 0, buffer_temp);
                         }
                     }
                     
-                    /* Telemetría UART (solo en modo medición activa) */
-                    if (estado_pantalla == DISPLAY_STATE_MEASURING) {
+                    // Solo env�a reportes UART cuando la medici�n es v�lida (Estado 4)
+                    if (estado_pantalla == 4) {
                         UART_SendString("--------------------------------------------\r\n");
                         UART_SendString("Temperatura : ");
                         UART_SendFloat(temperatura, 2);
@@ -417,87 +343,126 @@ void main(void) {
                         UART_SendString(" LPM\r\n");
                         UART_SendString("--------------------------------------------\r\n\r\n");
                     }
-                    
-                    /* Iniciar nueva conversión para el próximo ciclo */
-                    DS18B20_StartConversion();
+                    DS18B20_StartConversion(); 
                 }
                 
-                /* ===== MÁQUINA DE ESTADOS DE HARDWARE Y PANTALLA ===== */
-                
-                /* ESTADO 0: SIN DEDO (Detección por umbral) */
-                if (datos_sensor.red < DETECTION_THRESHOLD) {
+                /**
+                * @brief Máquina de estados de interfaz y monitoreo.
+                *
+                * Estado 0:
+                * Espera de usuario sin mediciones previas.
+                *
+                * Estado 1:
+                * Visualización de la última medición almacenada.
+                *
+                * Estado 2:
+                * Proceso de adquisición y estabilización de sensores.
+                *
+                * Estado 4:
+                * Visualización activa de frecuencia cardíaca,
+                * temperatura corporal y alarmas.
+                */
+                if (datos_sensor.red < 15000) {
+                    /* -----------------------------------------------------
+                     * CONDICI�N 1: SIN DEDO EN EL SENSOR
+                     * ----------------------------------------------------- */
+                    
+                    temperatura_valida = 0;
+                    temperatura_estable = 0;
+                    ciclos_estabilizacion = 0;
+
                     LED_FUNCIONAL = 0;
                     LED_ESPERA = 1;
                     LED_ALARMA = 0; 
                     BUZZER = 0;
                     
-                    /* Actualizar pantalla solo si cambió el estado */
-                    if (estado_pantalla != DISPLAY_STATE_IDLE) {
-                        OLED_Clear();
-                        estado_pantalla = DISPLAY_STATE_IDLE;
-                        
-                        if (tiene_registro == 1) {
-                            /* Data-Hold: Mostrar últimos valores registrados */
-                            OLED_String(0, 0, " COLOQUE EL DEDO ");
-                            sprintf(buffer_texto, " LPM Ult: %-3u   ", ultimo_lpm);
+                    if (tiene_registro == 1) {
+                        // NUEVO ESTADO (1): Mostrar historial/retenci�n de datos previos
+                        if (estado_pantalla != 1) {
+                            OLED_Clear();
+                            OLED_String(0, 0, "ULTIMA MEDICION ");
+                            
+                            sprintf(buffer_texto, "LPM: %-3u        ", ultimo_lpm);
                             OLED_String(2, 0, buffer_texto);
-                            sprintf(buffer_temp, " Tmp Ult: %0.2f C", ultima_temp);
+                            
+                            sprintf(buffer_temp, "Temp:%0.2f C     ", ultima_temp);
                             OLED_String(4, 0, buffer_temp);
-                        } else {
-                            /* Primera vez: sin histórico */
-                            OLED_String(0, 0, "   PULSIOXIMETRO ");
-                            OLED_String(2, 0, " Coloque el dedo ");
-                            OLED_String(4, 0, " Temp: --.-- C   ");
+                            
+                            OLED_String(6, 0, "Coloque el dedo ");
+                            estado_pantalla = 1;
+                        }
+                    } else {
+                        // ESTADO (0): Espera inicial limpia (nunca se ha tomado una muestra)
+                        if (estado_pantalla != 0) {
+                            OLED_Clear();
+                            OLED_String(0, 0, "MONITOR CARDIACO");
+                            OLED_String(3, 0, "Coloque el dedo ");
+                            OLED_String(5, 0, "en el sensor    ");
+                            estado_pantalla = 0;
                         }
                     }
-                    lpm = 0; 
+
+                    lpm = 0;
                     last_lpm = 0;
                 } 
                 else {
-                    /* ESTADO CON DEDO DETECTADO */
+                    /* -----------------------------------------------------
+                     * CONDICI�N 2: DEDO DETECTADO (PROCESANDO INFORMACI�N)
+                     * ----------------------------------------------------- */
                     LED_ESPERA = 0;
                     LED_FUNCIONAL = 1;
                     
-                    latido_real = MAX30102_ProcesarBPM(datos_sensor.red, &lpm);
+                    unsigned char latido_real = MAX30102_ProcesarBPM(datos_sensor.red, &lpm);
                     
-                    if (lpm > 0) {
-                        /* --- MEDICIÓN ESTABLE --- */
-                        
-                        /* Verificación de alarmas clínicas */
-                        if (temperatura > TEMP_MAX || temperatura < TEMP_MIN || 
-                            lpm > BPM_MAX || lpm < BPM_MIN) {
-                            LED_ALARMA = 1;  
-                            BUZZER = 1;      /* Alarma activa */
-                        } else {
-                            LED_ALARMA = 0;  
-                            BUZZER = 0;      /* Parámetros dentro del rango normal */
+                    if (!temperatura_estable || lpm == 0) {
+                        /* ESTADO 2: PROCESANDO / CALCULANDO */
+                        LED_ALARMA = 0;
+                        BUZZER = 0;
+
+                        if (estado_pantalla != 2) {
+                            OLED_Clear();
+                            OLED_String(0, 0, "PROCESANDO      ");
+                            OLED_String(2, 0, "MEDICIONES...   ");
+                            OLED_String(5, 0, "ESPERE          ");
+                            estado_pantalla = 2;
                         }
-                        
-                        /* Actualizar pantalla si hay cambios significativos */
-                        if (estado_pantalla != DISPLAY_STATE_MEASURING || 
-                            latido_real || lpm != last_lpm) {
-                            OLED_String(0, 0, "   PULSIOXIMETRO ");
-                            sprintf(buffer_texto, " LPM: %-3u        ", lpm);
+                    }
+                    else {
+                        /* ESTADO 4: MEDICI�N HUMANA COMPLETA Y ESTABLE */
+
+                        // Evaluaci�n de umbrales m�dicos para alertas de alarma
+                        if (temperatura > TEMP_MAX || temperatura < TEMP_MIN || lpm > BPM_MAX || lpm < BPM_MIN) {
+                            LED_ALARMA = 1;
+                            BUZZER = 1;
+                        } else {
+                            LED_ALARMA = 0;
+                            BUZZER = 0;
+                        }
+
+                        // OPTIMIZACI�N DE PARPADEO:
+                        // Si cambiamos de estado hacia el 4, limpiamos y dibujamos la estructura fija una sola vez.
+                        if (estado_pantalla != 4) {
+                            OLED_Clear();
+                            OLED_String(0, 0, "PULSIOXIMETRO   ");
+                            estado_pantalla = 4;
+                            last_lpm = 999; // Forzamos la escritura inicial de los datos num�ricos
+                        }
+
+                        // Actualizaci�n selectiva de variables en pantalla sin usar OLED_Clear()
+                        if (latido_real || lpm != last_lpm) {
+                            sprintf(buffer_texto, "LPM: %-3u        ", lpm); // Los espacios al final limpian residuos previos
                             OLED_String(2, 0, buffer_texto);
-                            estado_pantalla = DISPLAY_STATE_MEASURING;
+
+                            sprintf(buffer_temp, "Temp:%0.2f C     ", temperatura);
+                            OLED_String(4, 0, buffer_temp);
+
                             last_lpm = lpm;
-                            
-                            /* Guardar en histórico para data-hold */
+
+                            // Actualizar y asegurar el historial en las variables globales de retenci�n
                             ultimo_lpm = lpm;
-                            if (temperatura > MIN_VALID_TEMP) {
-                                ultima_temp = temperatura;
-                            }
+                            ultima_temp = temperatura;
                             tiene_registro = 1;
                         }
-                    } else {
-                        /* --- ESTADO TRANSITORIO: Dedo detectado, estabilizando señal --- */
-                        if (estado_pantalla != DISPLAY_STATE_CALCULATING) {
-                            OLED_String(0, 0, "   PULSIOXIMETRO ");
-                            OLED_String(2, 0, " Calculando...   ");
-                            estado_pantalla = DISPLAY_STATE_CALCULATING;
-                        }
-                        LED_ALARMA = 0;  
-                        BUZZER = 0;      /* Sin alarmas durante estabilización */
                     }
                 }
             }
